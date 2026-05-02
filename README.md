@@ -1,31 +1,26 @@
 # gdrive-eversolo-sync
 
-Claude Code skill + standalone scripts for an **Eversolo DMP-A6** (or other
-Zidoo-platform network music player). Two things in one repo:
+Claude Code skill + standalone scripts for keeping an **Eversolo DMP-A6**
+(or other Zidoo-platform network music player) mirrored from a **Google
+Drive** master library.
 
-1. **A Bash CLI to play music on the Eversolo from a Linux terminal** —
-   transport (play/pause/next/seek/volume), now-playing, queue inspection,
-   indexed library search across the SMB share, and M3U playlist generation
-   with `smb://` URIs.
-2. **An album-aware, one-way sync workflow** between a **Google Drive master
-   library** and the Eversolo. It understands that the same album can live
-   under different folder names on each side, and that file-format
-   differences (FLAC ⇄ ALAC ⇄ AIFF ⇄ WAV) shouldn't trigger a sync. Anything
-   that's only on the Eversolo or where Eversolo wins gets uploaded to a
-   separate `Music-unsynced/` folder on Drive so the master stays clean.
+The workflow is one-way (Drive → Eversolo) and album-aware: it understands
+that the same album can live under different folder names on each side, and
+that file-format differences (FLAC ⇄ ALAC ⇄ AIFF ⇄ WAV) shouldn't trigger a
+sync. Anything that's only on the Eversolo or where Eversolo wins gets
+uploaded to a separate `Music-unsynced/` folder on Drive so the master stays
+clean.
 
 > **Platform support:** developed and tested on **Linux** (Ubuntu 20.04).
-> The control / library / sync scripts have **not been tested on macOS**;
-> they rely on `gio` (GVFS) for SMB mounts and standard GNU userland (`bash`,
-> `awk`, `find -printf`, `python3`). They may or may not work on macOS as-is.
-> Patches welcome.
+> The scripts rely on rclone, GNU `awk`/`find`, and `python3` (with optional
+> `mutagen` / `ffprobe` for tag verification). **Not tested on macOS** —
+> may or may not work as-is.
 
 ## What's here
 
 ```
 SKILL.md                            Claude Code skill definition
 scripts/
-  eversolo                          device control + library search/playlist
   eversolo-make-plan                generate ~/sync-plan.md (album-level diff)
   eversolo-sync                     execute the plan (rclone copy; dry-run by default)
 templates/
@@ -34,12 +29,7 @@ templates/
 
 ## Install
 
-Either as a Claude Code skill (recommended for Claude users) or as
-plain scripts (works without Claude).
-
 ### As a Claude Code skill
-
-Clone into your skills dir:
 
 ```bash
 mkdir -p ~/.claude/skills
@@ -56,30 +46,13 @@ the skill and follow the workflow.
 git clone https://github.com/rc1999/gdrive-eversolo-sync.git
 cd gdrive-eversolo-sync
 chmod +x scripts/*
-ln -s "$PWD/scripts/eversolo"           ~/.local/bin/eversolo
 ln -s "$PWD/scripts/eversolo-make-plan" ~/.local/bin/eversolo-make-plan
 ln -s "$PWD/scripts/eversolo-sync"      ~/.local/bin/eversolo-sync
 ```
 
 ## One-time setup
 
-### 1. Eversolo discovery
-
-```bash
-avahi-browse -rt _eversolo._tcp     # find your device
-export EVERSOLO=192.168.x.y         # the device IP
-```
-
-The TXT record reveals the SMB share user/password (or shows the device's
-defaults). Find your USB drive's volume UUID by mounting the share:
-
-```bash
-gio mount smb://$EVERSOLO/Share/      # then enter SMB credentials
-ls /run/user/$UID/gvfs/smb-share*/    # one dir per volume; e.g. 7DEF-F569
-export EVERSOLO_MUSIC_REL=7DEF-F569/Music
-```
-
-### 2. rclone
+### 1. rclone
 
 Install rclone (any method — `apt`, `brew`, the official installer, or the
 plain binary). Then configure two remotes:
@@ -98,28 +71,34 @@ umask 077 && printf '%s' 'YOUR_CONFIG_PASS' > /tmp/rcpass
 
 The skill auto-detects this file; otherwise pass `--password-command "cat /path"`.
 
+### 2. Find your Eversolo's USB volume UUID
+
+The Eversolo exposes its attached storage by volume UUID under the SMB
+share. Find it once and bake it into your `EVERSOLO_BASE`:
+
+```bash
+rclone --password-command "cat /tmp/rcpass" lsd eversolo:Share
+# -> 7DEF-F569      <-- your USB drive's UUID
+# -> Storage
+```
+
+So your music root is `eversolo:Share/7DEF-F569/Music` (substitute your UUID).
+
 ## Usage
 
 ```bash
-# Discovery and control
-eversolo status                           # current track + queue
-eversolo play | pause | next | volume 150 # range is 0–200, NOT 0–100
-eversolo index                            # index the SMB library locally
-eversolo search bill evans                # AND-match across artist/album/track
-eversolo playlist -o jazz.m3u8 audiophile
-
-# Diff + plan + apply
 eversolo-make-plan                        # writes ~/sync-plan.md
 eversolo-make-plan --verify-tags          # add tag-comparison appendix (slower)
 eversolo-sync                             # dry-run, all actions
 eversolo-sync --apply                     # actually do it
 eversolo-sync --apply --only PULL         # one phase at a time
+eversolo-sync --apply --only UPLOAD-UNSYNCED
 ```
 
 After a sync, **manually trigger a rescan on the Eversolo** (Music app →
-pull-down to refresh, or Settings → Music Library → Rescan). The HTTP API
-can't drive the rescan — its scanner endpoints require an undiscovered
-registration handshake the Eversolo phone app does.
+pull-down to refresh, or Settings → Music Library → Rescan). The Eversolo's
+HTTP API exposes scanner endpoints, but they require an undiscovered
+registration handshake the phone app does — they can't be driven from here.
 
 ## How it decides what to sync
 
@@ -160,12 +139,20 @@ incomplete copies cluttering up the canonical library. So this skill sends
 Drive root — preserved as cloud backup, but never part of the official
 library.
 
+## Tag verification (optional)
+
+`eversolo-make-plan --verify-tags` reads embedded `artist` / `albumartist` /
+`album` / `date` tags from one representative track per priority album. For
+Drive, it fetches partial bytes via `rclone cat --head 500000` (and `--tail`
+for M4A — the `moov` atom can live at the end of the file). It uses
+`mutagen` first and falls back to `ffprobe` for AIFF variants mutagen
+doesn't grok. The result is appended to the plan as a Tag-verification
+appendix, useful for catching real false-matches the path-based normalizer
+can't see (e.g. wrong-artist tags on Drive).
+
 ## Tested with
 
-- **OS**: Ubuntu 20.04 (Linux). **Not tested on macOS** — the Bash control
-  CLI and sync scripts depend on `gio` (GVFS), GNU `find -printf`, and the
-  standard Linux userland. Some pieces may run on macOS unmodified, others
-  (especially the GVFS SMB mount path) won't.
+- **OS**: Ubuntu 20.04 (Linux). **Not tested on macOS.**
 - Eversolo DMP-A6 firmware v1.5.75 (Android 11)
 - rclone v1.74
 

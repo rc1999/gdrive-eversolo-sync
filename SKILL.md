@@ -1,131 +1,88 @@
 ---
 name: gdrive-eversolo-sync
-description: Bash CLI to play music on an Eversolo network music player (DMP-A6 and other Zidoo-platform devices) from a Linux terminal — transport control (play/pause/next/seek/volume), now-playing, queue inspection, SMB library search, M3U playlist generation. Plus an album-aware, one-way sync workflow that mirrors a Google Drive master library to the Eversolo. Format-only differences (FLAC ⇄ ALAC ⇄ AIFF) never trigger a sync. Eversolo-only or Eversolo-wins material is uploaded to a separate Music-unsynced/ folder on Drive so the master stays clean. Tested on Linux (Ubuntu 20.04); not tested on macOS — relies on gio/GVFS, GNU find, and standard Linux userland.
+description: One-way, album-aware sync from a Google Drive master music library to an Eversolo network music player (DMP-A6 and other Zidoo-platform devices). Use when the user wants to diff Drive against the Eversolo, generate a content-based sync plan, and run the sync. Format-only differences (FLAC ⇄ ALAC ⇄ AIFF ⇄ WAV) never trigger a sync. Eversolo-only or Eversolo-wins material is uploaded to a separate Music-unsynced/ folder on Drive so the master stays clean. Tested on Linux (Ubuntu 20.04); not tested on macOS.
 ---
 
-# Drive ↔ Eversolo control + sync (Linux)
+# Drive → Eversolo sync
 
-Two things this skill provides:
-
-1. A **Bash CLI for playing music on the Eversolo from a Linux terminal** —
-   transport (play/pause/next/seek/volume up to 200 = 0 dB), now-playing,
-   queue inspection, library search over the SMB share, M3U playlist
-   generation with `smb://` URIs.
-2. **End-to-end Drive ⇄ Eversolo sync** with safe album-level diffing and a
-   side channel (`Music-unsynced/` on Drive) for material that shouldn't
-   pollute the master.
+End-to-end workflow for keeping an Eversolo DMP-A6 (or other Zidoo-platform
+network music player) mirrored from a Google Drive master library, with safe
+album-level diffing and a side channel for material that shouldn't pollute the
+master.
 
 **Platform note**: developed and tested on Linux only (Ubuntu 20.04). The
-scripts use `gio` (GVFS) for SMB mounts and GNU userland features
-(`find -printf`, etc.). **Not tested on macOS** — assume things break there
-unless you say otherwise.
+scripts use `rclone`, GNU userland, and `python3` (with optional `mutagen` /
+`ffprobe` for tag verification). **Not tested on macOS** — assume things may
+break there unless the user says otherwise.
 
 ## When to invoke this skill
 
 Trigger on requests like:
-- "find/discover music devices on my network" → discovery + control
-- "control / play / pause / queue on my Eversolo" → use `scripts/eversolo`
 - "diff my Eversolo library against Google Drive"
 - "sync my music from Drive to Eversolo"
 - "rclone won't let me push only what's missing on Eversolo"
-- "build a playlist of <X> from the library"
-- Any mention of Eversolo + Google Drive together
+- "what new albums will get pulled to my music player?"
+- Any mention of Eversolo + Google Drive together involving content sync
+
+This skill does **not** handle Eversolo playback control or library browsing.
+The Eversolo's HTTP API exposes a transport endpoint set on port 9529, but
+the actually-useful parts (play a specific track / album, trigger library
+rescan, browse the library) are all gated behind a registration handshake
+the Eversolo phone app performs — those endpoints accept calls and return
+`status:200` but silently no-op without the right credentials. Use the
+Eversolo phone app or the device touchscreen for playback. This skill stays
+focused on the one thing rclone can reliably automate: file sync.
 
 ## What's in this skill
 
 ```
 scripts/
-  eversolo            # device control + library search/playlist (no rclone needed)
   eversolo-make-plan  # generate ~/sync-plan.md (Drive ⇄ Eversolo album-level diff)
   eversolo-sync       # execute the plan (rclone copy; dry-run by default)
 templates/
   Music-unsynced-README.md   # uploaded to user's Drive Music-unsynced/ on first run
 ```
 
-All three scripts read configuration from environment variables and have
-sensible defaults. Run any of them with `--help` to see options.
+Both scripts read configuration from environment variables and have sensible
+defaults. Run with `--help` to see options.
 
 ## Workflow
 
-### 1. Discovery and control (no rclone, no Drive needed)
+### 1. Prereqs (one-off)
 
 ```bash
-# Find Eversolo / AirPlay / Spotify Connect / Tidal Connect on the LAN
-avahi-browse -rt _eversolo._tcp
-avahi-browse -rt _raop._tcp
-
-# Use the device control script (set EVERSOLO=<ip> if discovery didn't auto-fill)
-scripts/eversolo status         # now-playing + volume + queue
-scripts/eversolo play|pause|next|prev|seek <ms>
-scripts/eversolo volume 150     # range is 0–200, NOT 0–100
-scripts/eversolo queue 50
-
-# Library access via SMB share `Share/<volume-uuid>/Music/`
-# Default user is set in device Settings → Storage → Network Share
-# Mount with gio:
-gio mount smb://<eversolo-ip>/Share/
-
-# Build a local index of the library, then search and make playlists
-scripts/eversolo index                            # ~1–2 min over Wi-Fi
-scripts/eversolo search bill evans
-scripts/eversolo playlist -o album.m3u8 audiophile
-```
-
-The control script talks to the Eversolo's HTTP API on port 9529
-(unauthenticated on the LAN). The Zidoo-style endpoints used:
-
-- `/ZidooControlCenter/getModel`            — device info
-- `/ZidooMusicControl/v2/getState`          — now-playing
-- `/ZidooMusicControl/v2/getVolume`         — read volume (max=200)
-- `/ZidooMusicControl/v2/setVolume?volume=<0-200|up|down|mute>`
-- `/ZidooMusicControl/v2/playOrPause`       — toggle (single endpoint)
-- `/ZidooMusicControl/v2/playNext` / `playLast`
-- `/ZidooMusicControl/v2/seekTo?time=<ms>`
-- `/ZidooMusicControl/v2/getPlayQueue?start=&count=`
-
-Library-browse endpoints (`/ZidooMusicControl/v3/getAlbumList`,
-`/MusicService/v2/...`) exist but require an undiscovered registration
-handshake — do NOT try to brute-force parameters. Use SMB for library reads.
-
-### 2. First-time rclone setup (one-off)
-
-```bash
-# Install rclone if needed
-curl -fsSL https://rclone.org/install.sh | sudo bash
-# or user-only:
-curl -fsSL -o /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip \
-  && unzip -q /tmp/rclone.zip -d /tmp \
-  && install -m 0755 /tmp/rclone-v*-linux-amd64/rclone ~/.local/bin/rclone
-
-# Configure two remotes (interactive; OAuth needs a browser):
-rclone config           # -> n -> name=gmusic    -> drive  (scope=full)
-rclone config           # -> n -> name=eversolo  -> smb    (host, user, pass)
-
+# rclone installed; two remotes configured:
+#   gmusic   (drive)   — your Google Drive
+#   eversolo (smb)     — your Eversolo's SMB share
+rclone config
 # If config is password-encrypted, store the password in /tmp/rcpass mode 0600
-# (then pass --password-command "cat /tmp/rcpass" to every rclone call).
+# (the scripts auto-detect this file):
 umask 077 && printf '%s' 'YOUR_PASS' > /tmp/rcpass
 ```
 
 Default remote names this skill expects:
 - `gmusic:Music/`           — Drive **master** library
 - `gmusic:Music-unsynced/`  — Drive holding pen for Eversolo-only/wins
-- `eversolo:Share/<UUID>/Music/`  — Eversolo SMB
+- `eversolo:Share/<UUID>/Music/`  — Eversolo SMB (replace `<UUID>` with the
+  USB drive's volume UUID; see `rclone lsd eversolo:Share`)
 
-Override via env: `DRIVE_REMOTE`, `DRIVE_MUSIC_PATH`, `DRIVE_UNSYNCED_PATH`,
-`EVERSOLO_REMOTE`, `EVERSOLO_BASE`.
+Override via env: `DRIVE_MASTER`, `DRIVE_UNSYNCED`, `EVERSOLO_BASE`,
+`RCLONE_PASS_FILE`, `EVERSOLO_PLAN`.
 
-### 3. Generate the diff plan
+### 2. Generate the diff plan
 
 ```bash
 scripts/eversolo-make-plan -o ~/sync-plan.md
+# optional: tag-comparison pass on priority items (slower)
+scripts/eversolo-make-plan --verify-tags
 ```
 
 What it does:
-1. Lists every audio file on each side (rclone `lsf -R --files-only` filtered
-   to FLAC/MP3/M4A/WAV/AIF/AIFF/DSF/DFF/OGG/ALAC).
+1. Lists every audio file on each side via `rclone lsf -R --files-only`,
+   filtered to FLAC/MP3/M4A/WAV/AIF/AIFF/DSF/DFF/OGG/ALAC.
 2. Two-pass album matching:
-   - **Pass 1**: normalized `(artist | album)` — case + diacritics + punctuation
-     insensitive.
+   - **Pass 1**: normalized `(artist | album)` — case + diacritics +
+     punctuation insensitive.
    - **Pass 2** (fallback): album-name only with `[brackets]`, `(parens)`,
      and catalog-code prefixes (e.g. `AS09 -`, `[CS 8271]`, `[mono]`,
      `[Disc N]`) stripped, and `Various`/`Various Artists`/`Compilations`/
@@ -141,12 +98,7 @@ What it does:
    SKIP              eversolo <path>
    ```
 
-When the user wants higher-confidence diffs, run with `--verify-tags` to
-sample one track per album (head 500 KB; tail for M4A) and confirm artist /
-album / albumartist embedded tags. The tag pass surfaces real false-matches
-the path-based normalizer can't see (e.g. wrong-artist tags on Drive).
-
-### 4. Apply the sync
+### 3. Apply the sync
 
 ```bash
 scripts/eversolo-sync                              # dry-run, all actions
@@ -159,6 +111,15 @@ The script reads `~/sync-plan.md`'s machine-readable section and runs
 `rclone copy` (additive — never deletes) for each `PULL` and `UPLOAD-UNSYNCED`
 line. Other actions (`REFACTOR`, `DUP-*`) are informational and produce no
 rclone commands; they need human decisions.
+
+### 4. After the sync — rescan on the Eversolo (manual)
+
+Tell the user to trigger a rescan via the Eversolo Music app
+(pull-down-to-refresh on the album/artist list) or
+**Settings → Music Library → Rescan / Refresh**. The HTTP API can't drive
+this — its `MusicScanner/*` and `MediaScanner/*` endpoints return
+`status:801` ("application element is not registered") without the phone
+app's handshake.
 
 ## Critical conventions
 
@@ -175,42 +136,31 @@ rclone commands; they need human decisions.
 - **One canonical PULL path per album key.** When Drive has multiple folders
   for the same normalized album, only emit ONE `PULL` line so duplicates
   don't propagate to the Eversolo.
-- **The Eversolo volume range is 0–200, not 0–100.** 200 = 0 dB, 100 ≈ -30 dB.
 
 ## Common pitfalls
 
 - **rclone `cat --head 200K` does not work** (rclone's `--head` takes raw
   bytes). Use `--head 200000`. Same for `--tail`.
-- **`gio mount` with empty/anonymous credentials returns a friendly listing
-  for shares you can't actually read.** Always provide username + password.
-- **The Eversolo's HTTP API on :9529 has no auth on the LAN.** That's by
-  design but worth noting — the device's mDNS TXT broadcasts `password=`
-  (often empty). Encourage the user to set a non-empty admin password if
-  guests share the Wi-Fi.
 - **`MusicScanner/*` and `MediaScanner/*` endpoints return 801** ("application
   element is not registered"). The Eversolo phone app does a registration
   handshake we haven't reverse-engineered. To trigger a library rescan, the
-  user has to use the device UI (Music app → pull-down to refresh, or
-  Settings → Music Library → Rescan).
+  user has to use the device UI.
+- **`playMusic`, `openFile`, etc. for triggering playback by path also
+  silently no-op** — they accept the call and return `status:200` but don't
+  actually play anything. Same gating as the scanner. Don't try to drive
+  Eversolo playback from this skill.
 - **mutagen fails on some `.aif` variants** with `unsupported format`. Fall
   back to `ffprobe -show_format -show_streams` for those.
 
-## After a sync, prompt the user to
-
-1. Open the Eversolo Music app and pull-down-to-refresh (or Settings →
-   Music Library → Rescan) — the API can't trigger this remotely.
-2. Verify a sample of the new artist folders shows up (use the PULL list
-   from `~/sync-plan.md` as a check-list).
-
 ## Tag-verification appendix (when `--verify-tags` is used)
 
-The plan generator's tag pass:
+The plan generator's optional tag pass:
 - Reads ~one track per album from each side.
 - For Drive, fetches partial bytes via `rclone cat --head 500000`; if mutagen
   fails on M4A, retries with `--tail 500000` (M4A `moov` atom can live at the
   end of the file).
 - Compares `artist` / `albumartist` / `album` / `date` tags after the same
-  `n_basic` normalization used for paths.
+  normalization used for paths.
 - Emits a comparison block that's appended to the plan as the final section.
 
 The tag pass is OPTIONAL; default plans rely on path-based matching alone.
