@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""
+Generate a Drive (master) ⇄ Eversolo (mirror) sync plan as Markdown.
+
+Reads both sides via rclone, performs album-level matching that ignores file
+formats and most folder-naming inconsistencies, and writes a Markdown plan
+whose trailing fenced block is a TSV machine-readable section that
+`eversolo-sync` consumes.
+
+Defaults assume the rclone remotes are named `gmusic` and `eversolo` — see
+the SKILL.md for setup. Override via env or flags.
+"""
+
+import argparse, collections, datetime, os, re, subprocess, sys, tempfile, unicodedata
+from pathlib import Path
+
+# ---------- normalization ------------------------------------------------
+
+COMP_ALIASES = {
+    "various", "various artists", "compilations", "compilation",
+    "soundtracks", "soundtrack", "ost",
+}
+
+def n_basic(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+def n_album(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    s = re.sub(r"\[[^\]]*\]", " ", s)
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"^\s*[a-z]{1,4}\s*[-:]?\s*\d+\s*[-:]?\s*", "", s)  # AS09 - / CS 8271 / disc 2
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+def n_artist(s: str) -> str:
+    a = n_basic(s)
+    return "_VA_" if a in COMP_ALIASES else a
+
+# ---------- rclone helpers -----------------------------------------------
+
+AUDIO_EXTS = ("flac", "mp3", "m4a", "wav", "aiff", "aif",
+              "dsf", "dff", "ogg", "alac")
+
+def rclone_args(password_command):
+    a = ["rclone"]
+    if password_command:
+        a += ["--password-command", password_command]
+    return a
+
+def list_audio(remote_path, password_command):
+    """rclone lsf -R --files-only filtered to audio extensions; returns list of relative paths."""
+    pat = "{" + ",".join(e + "," + e.upper() for e in AUDIO_EXTS).rstrip(",") + "}"
+    cmd = rclone_args(password_command) + [
+        "lsf", "-R", "--files-only",
+        "--include", f"*.{pat}",
+        remote_path,
+    ]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    return [ln for ln in out.splitlines() if ln]
+
+# ---------- album indexing ----------------------------------------------
+
+def index_albums(file_list):
+    """Return {(artist_norm, album_norm): {paths, exts, files, tracks}}."""
+    by = collections.defaultdict(lambda: {
+        "paths": set(),
+        "exts": collections.Counter(),
+        "files": collections.defaultdict(list),
+        "tracks": 0,
+    })
+    for line in file_list:
+        segs = line.split("/")
+        if len(segs) < 2:
+            continue
+        artist = segs[-3] if len(segs) >= 3 else ""
+        album  = segs[-2]
+        ext = segs[-1].rsplit(".", 1)[-1].lower() if "." in segs[-1] else ""
+        ap = "/".join(segs[:-1])
+        k = (n_artist(artist), n_album(album))
+        by[k]["paths"].add(ap)
+        by[k]["exts"][ext] += 1
+        by[k]["files"][ap].append(line)
+        by[k]["tracks"] += 1
+    return by
+
+# ---------- tag verification (optional) ---------------------------------
+
+def fetch_partial(remote_path, n=500_000, tail=False, password_command=None):
+    """rclone cat (head or tail) → temp file, return path."""
+    fd, tmp = tempfile.mkstemp(suffix="." + remote_path.rsplit(".", 1)[-1])
+    os.close(fd)
+    cmd = rclone_args(password_command) + [
+        "cat", "--tail" if tail else "--head", str(n), remote_path,
+    ]
+    with open(tmp, "wb") as f:
+        subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL, check=False)
+    return tmp
+
+def read_tags_local(path):
+    """Mutagen first; ffprobe fallback for AIFF variants mutagen doesn't grok."""
+    try:
+        from mutagen import File as MFile
+        m = MFile(path, easy=True)
+        if m is not None:
+            tags = m.tags or {}
+            out = {}
+            for k in ("artist", "albumartist", "album", "date"):
+                v = tags.get(k) if hasattr(tags, "get") else None
+                if isinstance(v, list) and v:
+                    v = v[0]
+                if v is not None:
+                    out[k] = str(v)
+            return out
+    except Exception:
+        pass
+    # ffprobe fallback
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries",
+             "format_tags=artist,albumartist,album,date",
+             "-of", "default=noprint_wrappers=1:nokey=0", path],
+            capture_output=True, text=True, check=False, timeout=8,
+        ).stdout
+        d = {}
+        for line in out.splitlines():
+            if "=" not in line: continue
+            k, v = line.split("=", 1)
+            k = k.replace("TAG:", "").lower().strip()
+            if k in ("artist", "albumartist", "album", "date"):
+                d[k] = v.strip()
+        return d or {"_err": "no tags"}
+    except FileNotFoundError:
+        return {"_err": "mutagen failed and ffprobe not installed"}
+
+def read_tags_remote(remote_path, password_command):
+    snap = fetch_partial(remote_path, password_command=password_command)
+    t = read_tags_local(snap)
+    if "_err" in t and remote_path.lower().endswith((".m4a", ".alac", ".mp4", ".aac")):
+        os.unlink(snap)
+        snap = fetch_partial(remote_path, tail=True, password_command=password_command)
+        t = read_tags_local(snap)
+    try: os.unlink(snap)
+    except OSError: pass
+    return t
+
+# ---------- diffing ------------------------------------------------------
+
+def classify(ev, gd):
+    """Two-pass match. Returns named buckets keyed by (artist, album)."""
+    ev_keys, gd_keys = set(ev), set(gd)
+    both = ev_keys & gd_keys
+
+    gd_album_idx = collections.defaultdict(list)
+    for k, info in gd.items():
+        gd_album_idx[k[1]].append((k, info))
+    ev_album_idx = collections.defaultdict(list)
+    for k, info in ev.items():
+        ev_album_idx[k[1]].append((k, info))
+
+    # PULL = on Drive, missing from Eversolo (no Pass-2 album-name match)
+    pull, drive_already_ev = [], []
+    for k in sorted(gd_keys - ev_keys):
+        m = ev_album_idx.get(k[1], [])
+        (drive_already_ev if m else pull).append((k, m) if m else k)
+
+    # ANOMALY = on Eversolo, missing from Drive (no Pass-2 either)
+    anomaly, ev_already_drive = [], []
+    for k in sorted(ev_keys - gd_keys):
+        m = gd_album_idx.get(k[1], [])
+        (ev_already_drive if m else anomaly).append((k, m) if m else k)
+
+    # MORE-COMPLETE = both sides have it, Eversolo has strictly more tracks
+    more_complete = []
+    for k in sorted(both):
+        if ev[k]["tracks"] > gd[k]["tracks"]:
+            more_complete.append((k, ev[k]["tracks"], gd[k]["tracks"]))
+
+    dup_drive = {k: v for k, v in gd.items() if len(v["paths"]) > 1}
+    dup_ev    = {k: v for k, v in ev.items() if len(v["paths"]) > 1}
+
+    return dict(both=both, pull=pull, drive_already_ev=drive_already_ev,
+                anomaly=anomaly, ev_already_drive=ev_already_drive,
+                more_complete=more_complete,
+                dup_drive=dup_drive, dup_ev=dup_ev)
+
+# ---------- markdown rendering ------------------------------------------
+
+def fmt_album(d):
+    paths = sorted(d["paths"])
+    fmts = "+".join(f"{n}× {e}" for e, n in d["exts"].most_common())
+    extra = (" (also: " + ", ".join(paths[1:]) + ")") if len(paths) > 1 else ""
+    return paths[0], fmts, extra
+
+def line_for(d):
+    p, fmts, extra = fmt_album(d)
+    return f"- `{p}` — {d['tracks']} tracks ({fmts}){extra}"
+
+def render(plan, ev, gd, drive_master, drive_unsynced, eversolo_base, tag_text=""):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    out = []
+    w = out.append
+
+    pull             = plan["pull"]
+    anomaly          = plan["anomaly"]
+    more_complete    = plan["more_complete"]
+    drive_already_ev = plan["drive_already_ev"]
+    ev_already_drive = plan["ev_already_drive"]
+    dup_drive        = plan["dup_drive"]
+    dup_ev           = plan["dup_ev"]
+    both             = plan["both"]
+
+    # paths to upload, deduped
+    upload_paths = set()
+    for k in anomaly:
+        for p in ev[k]["paths"]:
+            upload_paths.add(p)
+    for (k, et, gt) in more_complete:
+        for p in ev[k]["paths"]:
+            upload_paths.add(p)
+
+    w(f"# Music sync plan — Drive (master) → Eversolo (mirror)")
+    w(f"\n_Generated: {now}_\n")
+    w(f"## Strategy\n\n"
+      f"- **`{drive_master}`** is the master. Sync flows **Drive → Eversolo**, one-way, additive.\n"
+      f"- **`{drive_unsynced}`** holds Eversolo-only or Eversolo-wins material so the master "
+      f"stays clean and other mirrors don't pick it up.\n"
+      f"- Album matching is content-based (artist+album, normalized; format-only differences "
+      f"never trigger a sync).\n")
+    w(f"**Drive `Music/` (master):** {sum(d['tracks'] for d in gd.values())} tracks across {len(gd)} albums\n")
+    w(f"**Eversolo (mirror):** {sum(d['tracks'] for d in ev.values())} tracks across {len(ev)} albums\n")
+
+    w("\n## Decision summary\n\n"
+      "| # | Bucket | Albums | Action |\n|--:|---|---:|---|\n"
+      f"| 1 | ✅ Same album on both (in sync) | {len(both)} | **none** |\n"
+      f"| 2 | 🔁 Same content, different folder name on each side | {len(ev_already_drive) + len(drive_already_ev)} | optional refactor (skip for first sync) |\n"
+      f"| 3 | ⬇️ **PULL** — Drive `Music/` only | {len(pull)} | **`rclone copy` Drive → Eversolo** |\n"
+      f"| 4 | ⬆️ **UPLOAD-TO-UNSYNCED** — Eversolo only or Eversolo-wins | **{len(upload_paths)}** | **`rclone copy` Eversolo → Drive `Music-unsynced/`** |\n"
+      f"| 5 | 🧹 Drive duplicate-album folders | {len(dup_drive)} | dedupe master (informational) |\n"
+      f"| 6 | 🧹 Eversolo duplicate-album folders | {len(dup_ev)} | dedupe mirror (informational) |\n"
+      "\n---\n")
+
+    w(f"\n## ⬇️ PULL — {len(pull)} albums to copy from Drive `Music/` to Eversolo\n")
+    for k in pull:
+        w(line_for(gd[k]))
+    w("")
+
+    w(f"\n## ⬆️ UPLOAD-TO-UNSYNCED — {len(upload_paths)} Eversolo paths to copy to Drive `Music-unsynced/`\n")
+    w(f"\n### 4a. Anomalies — present on Eversolo, no equivalent on Drive\n")
+    for k in anomaly:
+        w(line_for(ev[k]))
+    w("")
+    w(f"\n### 4b. Eversolo has a more-complete copy (more tracks than Drive's `Music/`)\n")
+    for (k, et, gt) in more_complete:
+        ep = sorted(ev[k]["paths"])[0]
+        gp = sorted(gd[k]["paths"])[0]
+        ef = "+".join(f"{n}×{e}" for e, n in ev[k]["exts"].most_common())
+        gf = "+".join(f"{n}×{e}" for e, n in gd[k]["exts"].most_common())
+        w(f"- **EV** `{ep}` — {et} tracks ({ef})  vs  **DR** `{gp}` — {gt} tracks ({gf})  → +{et - gt} tracks on Eversolo")
+    w("")
+
+    w(f"\n## 🔁 REFACTOR (informational) — same content, different folder structure\n")
+    for (k, matches) in ev_already_drive:
+        ev_p, ef, _ = fmt_album(ev[k])
+        w(f"- **EV** `{ev_p}` ({ef})")
+        for (_, gd_info) in matches:
+            for gp in sorted(gd_info["paths"]):
+                gf = '+'.join(f'{n}×{e}' for e, n in gd_info['exts'].most_common())
+                w(f"    ↔ **DR** `{gp}` ({gf})")
+    w("")
+
+    w(f"\n## 🧹 DUPLICATE-album folders on Drive — {len(dup_drive)}\n")
+    for k in sorted(dup_drive):
+        w(f"- `{k[0]} | {k[1]}`")
+        for p in sorted(dup_drive[k]["paths"]):
+            w(f"    - `{p}`")
+    w("")
+
+    if dup_ev:
+        w(f"\n## 🧹 DUPLICATE-album folders on Eversolo — {len(dup_ev)}\n")
+        for k in sorted(dup_ev):
+            w(f"- `{k[0]} | {k[1]}`")
+            for p in sorted(dup_ev[k]["paths"]):
+                w(f"    - `{p}`")
+        w("")
+
+    w(f"\n## ✅ MATCH — {len(both)} albums in sync\n")
+    w("| Album | EV formats | DR formats |\n|---|---|---|")
+    for k in sorted(both):
+        ev_p = sorted(ev[k]["paths"])[0]
+        ef = "+".join(f"{n}×{e}" for e, n in ev[k]["exts"].most_common())
+        gf = "+".join(f"{n}×{e}" for e, n in gd[k]["exts"].most_common())
+        marker = " ⚠ format diff" if ef != gf else ""
+        w(f"| `{ev_p}` | {ef} | {gf}{marker} |")
+    w("\n---\n")
+
+    # Machine-readable: only ONE PULL line per album (canonical Drive path)
+    w("\n## Machine-readable plan\n")
+    w("_Sync script reads only the lines below. Format: `ACTION<TAB>side<TAB>path[<TAB>note]`._\n\n```")
+    for k in pull:
+        canonical = sorted(gd[k]["paths"])[0]
+        w(f"PULL\tdrive\t{canonical}")
+    for k in anomaly:
+        for p in sorted(ev[k]["paths"]):
+            w(f"UPLOAD-UNSYNCED\teversolo\t{p}\treason:eversolo-only")
+    for (k, et, gt) in more_complete:
+        for p in sorted(ev[k]["paths"]):
+            w(f"UPLOAD-UNSYNCED\teversolo\t{p}\treason:more-complete-{et}vs{gt}")
+    for (k, matches) in ev_already_drive:
+        for p in sorted(ev[k]["paths"]):
+            for (_, gd_info) in matches:
+                for gp in sorted(gd_info["paths"]):
+                    w(f"REFACTOR\teversolo\t{p}\tcanonical-drive:{gp}")
+    for k in sorted(dup_drive):
+        for p in sorted(dup_drive[k]["paths"]):
+            w(f"DUP-DRIVE\tdrive\t{p}")
+    for k in sorted(dup_ev):
+        for p in sorted(dup_ev[k]["paths"]):
+            w(f"DUP-EVERSOLO\teversolo\t{p}")
+    for k in sorted(both):
+        for p in sorted(ev[k]["paths"]):
+            w(f"SKIP\teversolo\t{p}")
+    w("```")
+
+    if tag_text:
+        w("\n---\n\n## Tag-verification appendix\n\n```")
+        w(tag_text.rstrip())
+        w("```")
+
+    return "\n".join(out) + "\n"
+
+# ---------- tag-pass driver ---------------------------------------------
+
+def tag_verify(ev, gd, plan, drive_master, eversolo_base, password_command,
+               smb_mnt=None):
+    """Read tags for priority items, return a text report string.
+
+    smb_mnt: optional local path to the gvfs SMB mount root for fast reads of
+    Eversolo files. If None, falls back to rclone cat for the Eversolo side too.
+    """
+    out = ["TAG VERIFICATION (priority items only)", "=" * 78, ""]
+
+    def fmt(t):
+        if "_err" in t: return f"[error: {t['_err']}]"
+        return (f"artist={t.get('artist','?')!r}  albumartist={t.get('albumartist','?')!r}  "
+                f"album={t.get('album','?')!r}  date={t.get('date','?')}")
+
+    # Anomalies
+    out.append(f"## ANOMALY — {len(plan['anomaly'])} albums on Eversolo only")
+    for k in plan["anomaly"]:
+        for ap in sorted(ev[k]["paths"]):
+            f = sorted(ev[k]["files"][ap])[0]
+            if smb_mnt:
+                t = read_tags_local(os.path.join(smb_mnt, f))
+            else:
+                t = read_tags_remote(f"{eversolo_base}/{f}", password_command)
+            out.append(f"  EV: {ap}")
+            out.append(f"      sample: {f.split('/')[-1]}")
+            out.append(f"      tags:   {fmt(t)}")
+    out.append("")
+
+    # Pass-2 alias pairs (Eversolo path differs from Drive)
+    out.append(f"## REFACTOR (Pass-2 alias) — {len(plan['ev_already_drive'])} pairs")
+    for (k, matches) in plan["ev_already_drive"]:
+        for ap in sorted(ev[k]["paths"]):
+            f = sorted(ev[k]["files"][ap])[0]
+            if smb_mnt:
+                ev_t = read_tags_local(os.path.join(smb_mnt, f))
+            else:
+                ev_t = read_tags_remote(f"{eversolo_base}/{f}", password_command)
+            out.append(f"  EV: {ap}")
+            out.append(f"      tags: {fmt(ev_t)}")
+            for (_, gd_info) in matches:
+                for gp in sorted(gd_info["paths"]):
+                    gf = sorted(gd_info["files"][gp])[0]
+                    gd_t = read_tags_remote(f"{drive_master}/{gf}", password_command)
+                    same = (n_basic(ev_t.get('album', '')) == n_basic(gd_t.get('album', '')) and
+                            n_basic(ev_t.get('artist', '')) == n_basic(gd_t.get('artist', '')))
+                    mark = " ✅ TAG MATCH" if same else " ⚠️ TAG DIFF"
+                    out.append(f"      ↔ DR: {gp}{mark}")
+                    out.append(f"           tags: {fmt(gd_t)}")
+    out.append("")
+    return "\n".join(out)
+
+# ---------- main ---------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("-o", "--output", default=os.path.expanduser("~/sync-plan.md"),
+                    help="output Markdown path (default: ~/sync-plan.md)")
+    ap.add_argument("--drive-master", default=os.environ.get("DRIVE_MASTER", "gmusic:Music"),
+                    help="rclone path of Drive master library (default: gmusic:Music)")
+    ap.add_argument("--drive-unsynced", default=os.environ.get("DRIVE_UNSYNCED", "gmusic:Music-unsynced"),
+                    help="rclone path of Drive holding pen (default: gmusic:Music-unsynced)")
+    ap.add_argument("--eversolo-base", default=os.environ.get("EVERSOLO_BASE", "eversolo:Share/7DEF-F569/Music"),
+                    help="rclone path of Eversolo Music root (default: eversolo:Share/7DEF-F569/Music)")
+    ap.add_argument("--password-command", default=os.environ.get("RCLONE_PASSWORD_COMMAND",
+                    'cat /tmp/rcpass' if os.path.exists("/tmp/rcpass") else None),
+                    help="passed as rclone --password-command (default: 'cat /tmp/rcpass' if file exists)")
+    ap.add_argument("--verify-tags", action="store_true",
+                    help="run a tag-comparison pass on priority items and append to the plan")
+    ap.add_argument("--smb-mount",
+                    help="optional local gvfs SMB mount path for fast Eversolo reads "
+                         "during tag verification (e.g. /run/user/$UID/gvfs/smb-share:server=...,share=...)")
+    args = ap.parse_args()
+
+    print(f"[1/3] Listing audio files…", file=sys.stderr)
+    print(f"      Drive:    {args.drive_master}", file=sys.stderr)
+    gd_files = list_audio(args.drive_master, args.password_command)
+    print(f"      → {len(gd_files)} files on Drive", file=sys.stderr)
+    print(f"      Eversolo: {args.eversolo_base}", file=sys.stderr)
+    ev_files = list_audio(args.eversolo_base, args.password_command)
+    print(f"      → {len(ev_files)} files on Eversolo", file=sys.stderr)
+
+    print(f"[2/3] Building album indexes & diffing…", file=sys.stderr)
+    ev = index_albums(ev_files)
+    gd = index_albums(gd_files)
+    plan = classify(ev, gd)
+
+    tag_text = ""
+    if args.verify_tags:
+        print(f"[2.5] Tag-verifying {len(plan['anomaly']) + len(plan['ev_already_drive'])} priority items…",
+              file=sys.stderr)
+        tag_text = tag_verify(ev, gd, plan,
+                              drive_master=args.drive_master,
+                              eversolo_base=args.eversolo_base,
+                              password_command=args.password_command,
+                              smb_mnt=args.smb_mount)
+
+    print(f"[3/3] Writing {args.output}", file=sys.stderr)
+    md = render(plan, ev, gd,
+                drive_master=args.drive_master,
+                drive_unsynced=args.drive_unsynced,
+                eversolo_base=args.eversolo_base,
+                tag_text=tag_text)
+    Path(args.output).write_text(md)
+
+    print(f"  PULL:                  {len(plan['pull'])}", file=sys.stderr)
+    print(f"  UPLOAD-UNSYNCED paths: "
+          f"{sum(1 for k in plan['anomaly'] for _ in ev[k]['paths']) + sum(1 for k,_,_ in plan['more_complete'] for _ in ev[k]['paths'])}",
+          file=sys.stderr)
+    print(f"  REFACTOR pairs:        {len(plan['ev_already_drive']) + len(plan['drive_already_ev'])}",
+          file=sys.stderr)
+    print(f"  DUP-DRIVE:             {len(plan['dup_drive'])}", file=sys.stderr)
+    print(f"  DUP-EVERSOLO:          {len(plan['dup_ev'])}", file=sys.stderr)
+    print(f"  SKIP (in sync):        {len(plan['both'])}", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Read the machine-readable section of the sync plan and execute the listed
+# rclone copy operations.
+#
+#   eversolo-sync                       # dry-run, all actions
+#   eversolo-sync --apply               # actually do it
+#   eversolo-sync --only PULL           # filter to one action class
+#   eversolo-sync --only UPLOAD-UNSYNCED --apply
+#
+# Action classes handled:
+#   PULL              gmusic:Music/<p>          → eversolo:Share/<UUID>/Music/<p>
+#   UPLOAD-UNSYNCED   eversolo:Share/.../<p>    → gmusic:Music-unsynced/<p>
+# Everything else (REFACTOR, DUP-*, SKIP) is informational — no rclone command.
+#
+# Configurable via env (with defaults that match the SKILL):
+#   EVERSOLO_PLAN              default: ~/sync-plan.md
+#   RCLONE_PASS_FILE           default: /tmp/rcpass
+#   DRIVE_MASTER               default: gmusic:Music
+#   DRIVE_UNSYNCED             default: gmusic:Music-unsynced
+#   EVERSOLO_BASE              default: eversolo:Share/7DEF-F569/Music
+
+set -euo pipefail
+
+PLAN="${EVERSOLO_PLAN:-$HOME/sync-plan.md}"
+PASSFILE="${RCLONE_PASS_FILE:-/tmp/rcpass}"
+DRIVE_MASTER="${DRIVE_MASTER:-gmusic:Music}"
+DRIVE_UNSYNCED="${DRIVE_UNSYNCED:-gmusic:Music-unsynced}"
+EVERSOLO_BASE="${EVERSOLO_BASE:-eversolo:Share/7DEF-F569/Music}"
+
+APPLY=0
+ONLY=""
+EXTRA_RCLONE_ARGS=("--stats-one-line" "--stats=10s")
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply)        APPLY=1; shift ;;
+    --only)         ONLY="$2"; shift 2 ;;
+    --progress|-P)  EXTRA_RCLONE_ARGS+=("--progress"); shift ;;
+    --verbose|-v)   EXTRA_RCLONE_ARGS+=("-v"); shift ;;
+    -h|--help)      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)              echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -s "$PLAN" ]     || { echo "plan not found: $PLAN  (run eversolo-make-plan first)" >&2; exit 1; }
+
+RCLONE=( rclone )
+if [ -s "$PASSFILE" ]; then
+  RCLONE=( rclone --password-command "cat $PASSFILE" )
+fi
+
+# Extract the machine-readable section: any fenced block whose lines look like
+# ACTION<TAB>side<TAB>path[...]
+extract_plan() {
+  awk '
+    /^```$/ { in_block = !in_block; next }
+    in_block { print }
+  ' "$PLAN" | awk -F'\t' 'NF>=3 && $1 ~ /^[A-Z][A-Z0-9-]*$/ { print }'
+}
+
+print_summary() {
+  echo "Plan summary (from $PLAN):"
+  extract_plan | awk -F'\t' '{c[$1]++} END{for(k in c) printf "  %-20s %d\n", k, c[k]}' | sort
+  echo
+}
+
+run_rclone() {
+  if [ "$APPLY" -eq 1 ]; then
+    echo "+ rclone $*"
+    "${RCLONE[@]}" "$@"
+  else
+    echo "  (dry-run) rclone $*"
+  fi
+}
+
+print_summary
+[ "$APPLY" -eq 0 ] && {
+  echo "DRY-RUN — no files will be transferred. Re-run with --apply to execute."
+  echo
+}
+
+declare -i n_pull=0 n_upload=0 n_skip=0 n_other=0
+while IFS=$'\t' read -r action side path note; do
+  [ -z "${action:-}" ] && continue
+  if [ -n "$ONLY" ] && [ "$action" != "$ONLY" ]; then
+    continue
+  fi
+  case "$action" in
+    PULL)
+      src="$DRIVE_MASTER/$path"
+      dst="$EVERSOLO_BASE/$path"
+      echo
+      echo "PULL: $path"
+      run_rclone copy "$src" "$dst" "${EXTRA_RCLONE_ARGS[@]}"
+      n_pull+=1
+      ;;
+    UPLOAD-UNSYNCED)
+      src="$EVERSOLO_BASE/$path"
+      dst="$DRIVE_UNSYNCED/$path"
+      echo
+      echo "UPLOAD-UNSYNCED: $path"
+      [ -n "${note:-}" ] && echo "  reason: $note"
+      run_rclone copy "$src" "$dst" "${EXTRA_RCLONE_ARGS[@]}"
+      n_upload+=1
+      ;;
+    SKIP)         n_skip+=1 ;;
+    REFACTOR|DUP-DRIVE|DUP-EVERSOLO|ANOMALY|SKIP-ALIAS|DRIVE-ONLY|DRIVE-ALIAS)
+                  n_other+=1 ;;
+    *)            echo "warn: unknown action '$action' for path: $path" >&2 ;;
+  esac
+done < <(extract_plan)
+
+echo
+echo "=== done ==="
+echo "  PULL     processed:  $n_pull"
+echo "  UPLOAD   processed:  $n_upload"
+echo "  SKIP/other ignored:  $((n_skip + n_other))"
+[ "$APPLY" -eq 0 ] && echo "  (dry-run — re-run with --apply to actually transfer)"
