@@ -1,15 +1,24 @@
 # gdrive-eversolo-sync
 
-Claude Code skill + standalone scripts for keeping an **Eversolo DMP-A6**
-(or other Zidoo-platform network music player) mirrored from a **Google Drive**
-master library.
+Claude Code skill + standalone scripts for an **Eversolo DMP-A6** (or other
+Zidoo-platform network music player). Two things in one repo:
 
-The workflow is one-way (Drive → Eversolo) and album-aware: it understands
-that the same album can live under different folder names on each side, and
-that file-format differences (FLAC ⇄ ALAC ⇄ AIFF ⇄ WAV) shouldn't trigger a
-sync. Anything that's only on the Eversolo or where Eversolo wins gets
-uploaded to a separate `Music-unsynced/` folder on Drive so the master stays
-clean.
+1. **A Bash CLI to play music on the Eversolo from a Linux terminal** —
+   transport (play/pause/next/seek/volume), now-playing, queue inspection,
+   indexed library search across the SMB share, and M3U playlist generation
+   with `smb://` URIs.
+2. **An album-aware, one-way sync workflow** between a **Google Drive master
+   library** and the Eversolo. It understands that the same album can live
+   under different folder names on each side, and that file-format
+   differences (FLAC ⇄ ALAC ⇄ AIFF ⇄ WAV) shouldn't trigger a sync. Anything
+   that's only on the Eversolo or where Eversolo wins gets uploaded to a
+   separate `Music-unsynced/` folder on Drive so the master stays clean.
+
+> **Platform support:** developed and tested on **Linux** (Ubuntu 20.04).
+> The control / library / sync scripts have **not been tested on macOS**;
+> they rely on `gio` (GVFS) for SMB mounts and standard GNU userland (`bash`,
+> `awk`, `find -printf`, `python3`). They may or may not work on macOS as-is.
+> Patches welcome.
 
 ## What's here
 
@@ -153,10 +162,12 @@ library.
 
 ## Tested with
 
+- **OS**: Ubuntu 20.04 (Linux). **Not tested on macOS** — the Bash control
+  CLI and sync scripts depend on `gio` (GVFS), GNU `find -printf`, and the
+  standard Linux userland. Some pieces may run on macOS unmodified, others
+  (especially the GVFS SMB mount path) won't.
 - Eversolo DMP-A6 firmware v1.5.75 (Android 11)
 - rclone v1.74
-- Ubuntu 20.04 (gvfs SMB mounts; should work on any Linux with `gio` + a
-  recent rclone)
 
 ## License
 

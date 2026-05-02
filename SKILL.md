@@ -1,14 +1,24 @@
 ---
 name: gdrive-eversolo-sync
-description: Mirror a Google Drive music library (master) to an Eversolo network music player (DMP-A6 and similar Zidoo-based devices), one-way and album-aware. Use when the user wants to discover an Eversolo on the LAN, browse its SMB library, control playback, generate a content-based diff between Drive and the Eversolo, and run the sync. Format-only differences (FLAC ⇄ ALAC ⇄ AIFF) never trigger a sync. Eversolo-only or Eversolo-wins material is uploaded to a separate `Music-unsynced/` folder on Drive so the master stays clean.
+description: Bash CLI to play music on an Eversolo network music player (DMP-A6 and other Zidoo-platform devices) from a Linux terminal — transport control (play/pause/next/seek/volume), now-playing, queue inspection, SMB library search, M3U playlist generation. Plus an album-aware, one-way sync workflow that mirrors a Google Drive master library to the Eversolo. Format-only differences (FLAC ⇄ ALAC ⇄ AIFF) never trigger a sync. Eversolo-only or Eversolo-wins material is uploaded to a separate Music-unsynced/ folder on Drive so the master stays clean. Tested on Linux (Ubuntu 20.04); not tested on macOS — relies on gio/GVFS, GNU find, and standard Linux userland.
 ---
 
-# Drive ↔ Eversolo sync
+# Drive ↔ Eversolo control + sync (Linux)
 
-End-to-end workflow for keeping an Eversolo DMP-A6 (or other Zidoo-platform
-network music player) mirrored from a Google Drive master library, with safe
-album-level diffing and a side channel for material that shouldn't pollute the
-master.
+Two things this skill provides:
+
+1. A **Bash CLI for playing music on the Eversolo from a Linux terminal** —
+   transport (play/pause/next/seek/volume up to 200 = 0 dB), now-playing,
+   queue inspection, library search over the SMB share, M3U playlist
+   generation with `smb://` URIs.
+2. **End-to-end Drive ⇄ Eversolo sync** with safe album-level diffing and a
+   side channel (`Music-unsynced/` on Drive) for material that shouldn't
+   pollute the master.
+
+**Platform note**: developed and tested on Linux only (Ubuntu 20.04). The
+scripts use `gio` (GVFS) for SMB mounts and GNU userland features
+(`find -printf`, etc.). **Not tested on macOS** — assume things break there
+unless you say otherwise.
 
 ## When to invoke this skill
 
