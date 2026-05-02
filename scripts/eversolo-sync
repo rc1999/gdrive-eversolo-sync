@@ -3,13 +3,19 @@
 # rclone copy operations.
 #
 #   eversolo-sync                       # dry-run, all actions
-#   eversolo-sync --apply               # actually do it
+#   eversolo-sync --apply               # actually do it (additive only)
+#   eversolo-sync --apply --force       # also process FORMAT-REPLACE (destructive)
 #   eversolo-sync --only PULL           # filter to one action class
 #   eversolo-sync --only UPLOAD-UNSYNCED --apply
 #
 # Action classes handled:
 #   PULL              gmusic:Music/<p>          → eversolo:Share/<UUID>/Music/<p>
+#                       (rclone copy — additive)
 #   UPLOAD-UNSYNCED   eversolo:Share/.../<p>    → gmusic:Music-unsynced/<p>
+#                       (rclone copy — additive)
+#   FORMAT-REPLACE    gmusic:Music/<dp>          → eversolo:Share/.../<ep>
+#                       (rclone sync — DESTRUCTIVE: deletes Eversolo files not in Drive,
+#                        then copies in Drive's. Only runs with --force.)
 # Everything else (REFACTOR, DUP-*, SKIP) is informational — no rclone command.
 #
 # Configurable via env (with defaults that match the SKILL):
@@ -28,15 +34,17 @@ DRIVE_UNSYNCED="${DRIVE_UNSYNCED:-gmusic:Music-unsynced}"
 EVERSOLO_BASE="${EVERSOLO_BASE:-eversolo:Share/7DEF-F569/Music}"
 
 APPLY=0
+FORCE=0
 ONLY=""
 EXTRA_RCLONE_ARGS=("--stats-one-line" "--stats=10s")
 while [ $# -gt 0 ]; do
   case "$1" in
     --apply)        APPLY=1; shift ;;
+    --force)        FORCE=1; shift ;;
     --only)         ONLY="$2"; shift 2 ;;
     --progress|-P)  EXTRA_RCLONE_ARGS+=("--progress"); shift ;;
     --verbose|-v)   EXTRA_RCLONE_ARGS+=("-v"); shift ;;
-    -h|--help)      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -77,9 +85,16 @@ print_summary
   echo "DRY-RUN — no files will be transferred. Re-run with --apply to execute."
   echo
 }
+if [ "$FORCE" -eq 1 ]; then
+  echo "⚠️  --force enabled: FORMAT-REPLACE actions will run \`rclone sync\`,"
+  echo "    which DELETES Eversolo files not present on Drive (e.g. old-format"
+  echo "    copies of an album) before copying in Drive's version. Make sure"
+  echo "    the dry-run output looks right before re-running with --apply."
+  echo
+fi
 
-declare -i n_pull=0 n_upload=0 n_skip=0 n_other=0
-while IFS=$'\t' read -r action side path note; do
+declare -i n_pull=0 n_upload=0 n_replace=0 n_replace_skipped=0 n_skip=0 n_other=0
+while IFS=$'\t' read -r action side path note rest; do
   [ -z "${action:-}" ] && continue
   if [ -n "$ONLY" ] && [ "$action" != "$ONLY" ]; then
     continue
@@ -102,6 +117,23 @@ while IFS=$'\t' read -r action side path note; do
       run_rclone copy "$src" "$dst" "${EXTRA_RCLONE_ARGS[@]}"
       n_upload+=1
       ;;
+    FORMAT-REPLACE)
+      # path is the Drive source path; note is "eversolo:<ev_path>"
+      if [ "$FORCE" -ne 1 ]; then
+        n_replace_skipped+=1
+        continue
+      fi
+      ev_path="${note#eversolo:}"
+      src="$DRIVE_MASTER/$path"
+      dst="$EVERSOLO_BASE/$ev_path"
+      echo
+      echo "FORMAT-REPLACE (destructive):"
+      echo "  drive  : $path"
+      echo "  ev     : $ev_path"
+      [ -n "${rest:-}" ] && echo "  fmts   : $rest"
+      run_rclone sync "$src" "$dst" "${EXTRA_RCLONE_ARGS[@]}"
+      n_replace+=1
+      ;;
     SKIP)         n_skip+=1 ;;
     REFACTOR|DUP-DRIVE|DUP-EVERSOLO|ANOMALY|SKIP-ALIAS|DRIVE-ONLY|DRIVE-ALIAS)
                   n_other+=1 ;;
@@ -111,7 +143,10 @@ done < <(extract_plan)
 
 echo
 echo "=== done ==="
-echo "  PULL     processed:  $n_pull"
-echo "  UPLOAD   processed:  $n_upload"
-echo "  SKIP/other ignored:  $((n_skip + n_other))"
+echo "  PULL              processed:  $n_pull"
+echo "  UPLOAD-UNSYNCED   processed:  $n_upload"
+echo "  FORMAT-REPLACE    processed:  $n_replace"
+[ "$n_replace_skipped" -gt 0 ] && \
+  echo "  FORMAT-REPLACE    skipped:    $n_replace_skipped  (re-run with --force to process)"
+echo "  SKIP/other ignored:           $((n_skip + n_other))"
 [ "$APPLY" -eq 0 ] && echo "  (dry-run — re-run with --apply to actually transfer)"

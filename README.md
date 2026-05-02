@@ -90,10 +90,19 @@ So your music root is `eversolo:Share/7DEF-F569/Music` (substitute your UUID).
 eversolo-make-plan                        # writes ~/sync-plan.md
 eversolo-make-plan --verify-tags          # add tag-comparison appendix (slower)
 eversolo-sync                             # dry-run, all actions
-eversolo-sync --apply                     # actually do it
+eversolo-sync --apply                     # actually do it (additive only)
+eversolo-sync --apply --force             # also process FORMAT-REPLACE (destructive)
 eversolo-sync --apply --only PULL         # one phase at a time
 eversolo-sync --apply --only UPLOAD-UNSYNCED
 ```
+
+`--force` enables `FORMAT-REPLACE` — albums where the same content exists on
+both sides but the file format differs in the canonical folders. With
+`--force`, those are processed via `rclone sync` (rather than `copy`), which
+**deletes files on the Eversolo that aren't on Drive** (e.g. an old AIFF
+copy of an album you've since re-ripped to FLAC) and copies in Drive's
+versions. Always run a dry-run (`eversolo-sync --force`, no `--apply`) and
+inspect the diff first.
 
 After a sync, **manually trigger a rescan on the Eversolo** (Music app →
 pull-down to refresh, or Settings → Music Library → Rescan). The Eversolo's
@@ -121,13 +130,16 @@ The plan emits these action classes:
 |---|---|---|
 | `PULL`             | on Drive only — copy down  | Drive → Eversolo |
 | `UPLOAD-UNSYNCED`  | on Eversolo only or Eversolo wins | Eversolo → Drive `Music-unsynced/` |
+| `FORMAT-REPLACE`   | same album, format differs in canonical folders — opt-in via `--force` | Drive → Eversolo (`rclone sync`, destructive) |
 | `REFACTOR`         | same album, different folder names — informational | (none) |
 | `DUP-DRIVE`        | duplicate album folders on Drive (cleanup) | (none) |
 | `DUP-EVERSOLO`     | duplicate album folders on Eversolo | (none) |
 | `SKIP`             | matched on both sides | (none) |
 
-Only `PULL` and `UPLOAD-UNSYNCED` get translated to `rclone copy` calls; the
-others need human decisions and live in the plan as informational sections.
+`PULL` and `UPLOAD-UNSYNCED` translate to additive `rclone copy` calls.
+`FORMAT-REPLACE` translates to `rclone sync` (destructive at the album-folder
+level) and only runs with `--force`. The others need human decisions and
+live in the plan as informational sections.
 
 ## Why the side channel
 

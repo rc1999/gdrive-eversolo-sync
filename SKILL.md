@@ -102,15 +102,34 @@ What it does:
 
 ```bash
 scripts/eversolo-sync                              # dry-run, all actions
-scripts/eversolo-sync --apply                      # actually do it
+scripts/eversolo-sync --apply                      # actually do it (additive only)
+scripts/eversolo-sync --apply --force              # also process FORMAT-REPLACE (destructive)
 scripts/eversolo-sync --apply --only PULL          # one phase at a time
 scripts/eversolo-sync --apply --only UPLOAD-UNSYNCED
 ```
 
 The script reads `~/sync-plan.md`'s machine-readable section and runs
 `rclone copy` (additive — never deletes) for each `PULL` and `UPLOAD-UNSYNCED`
-line. Other actions (`REFACTOR`, `DUP-*`) are informational and produce no
-rclone commands; they need human decisions.
+line.
+
+**`FORMAT-REPLACE` is opt-in via `--force`.** It fires for albums where the
+same content exists on both sides but the file format differs in the
+canonical folders — for example Eversolo has an AIFF copy and Drive's
+master has both FLAC and AIFF, or Drive has migrated to FLAC and Eversolo
+still has the old m4a. With `--force`, those entries are processed via
+`rclone sync gmusic:Music/<dr_path> eversolo:Share/.../<ev_path>`, which is
+**destructive at the album-folder level**: it deletes files on the Eversolo
+that aren't on Drive (i.e. the old-format files), then copies Drive's files
+in. The format-mismatch detection compares the **canonical Drive folder**
+(alphabetically-first path under each normalized album key) to the
+**canonical Eversolo folder**, and additionally requires those paths to
+match under `n_basic` (case+diacritics+punctuation insensitive, but
+preserving `[brackets]`) — this avoids false positives like Drive's
+`Round About Midnight [Live] [Disc 2]` getting matched against Eversolo's
+regular `'Round About Midnight`.
+
+Other actions (`REFACTOR`, `DUP-*`) are informational and produce no rclone
+commands; they need human decisions.
 
 ### 4. After the sync — rescan on the Eversolo (manual)
 

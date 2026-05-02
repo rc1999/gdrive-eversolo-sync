@@ -177,12 +177,41 @@ def classify(ev, gd):
         if ev[k]["tracks"] > gd[k]["tracks"]:
             more_complete.append((k, ev[k]["tracks"], gd[k]["tracks"]))
 
+    # FORMAT-REPLACE = both sides have it, format SETS differ (Pass-1 match only).
+    # Compare the CANONICAL folder on each side (alphabetically-first when there
+    # are duplicates), since that's what `rclone sync` will actually operate on.
+    # Comparing aggregate Counters across all paths under one normalized key
+    # would flag Drive's DUP-DRIVE-inflated counts as format diffs — false
+    # positives. Excludes more-complete cases: those go to UPLOAD-UNSYNCED.
+    def canonical_exts(d):
+        canonical_path = sorted(d["paths"])[0]
+        files = d["files"][canonical_path]
+        return {f.rsplit(".", 1)[-1].lower() for f in files if "." in f}
+
+    more_complete_keys = {k for (k, _, _) in more_complete}
+    format_replace = []
+    for k in sorted(both):
+        if k in more_complete_keys:
+            continue
+        if canonical_exts(ev[k]) == canonical_exts(gd[k]):
+            continue
+        # Require the canonical paths on each side to refer to the same album
+        # under bracket-PRESERVING normalization. This excludes false positives
+        # like Drive's `Round About Midnight [Live] [Disc 2]` matching
+        # Eversolo's regular `'Round About Midnight` (n_album strips [Disc N]
+        # so they collapse to one key, but they're different albums).
+        ev_p = sorted(ev[k]["paths"])[0]
+        gd_p = sorted(gd[k]["paths"])[0]
+        if n_basic(ev_p) != n_basic(gd_p):
+            continue
+        format_replace.append(k)
+
     dup_drive = {k: v for k, v in gd.items() if len(v["paths"]) > 1}
     dup_ev    = {k: v for k, v in ev.items() if len(v["paths"]) > 1}
 
     return dict(both=both, pull=pull, drive_already_ev=drive_already_ev,
                 anomaly=anomaly, ev_already_drive=ev_already_drive,
-                more_complete=more_complete,
+                more_complete=more_complete, format_replace=format_replace,
                 dup_drive=dup_drive, dup_ev=dup_ev)
 
 # ---------- markdown rendering ------------------------------------------
@@ -205,6 +234,7 @@ def render(plan, ev, gd, drive_master, drive_unsynced, eversolo_base, tag_text="
     pull             = plan["pull"]
     anomaly          = plan["anomaly"]
     more_complete    = plan["more_complete"]
+    format_replace   = plan["format_replace"]
     drive_already_ev = plan["drive_already_ev"]
     ev_already_drive = plan["ev_already_drive"]
     dup_drive        = plan["dup_drive"]
@@ -233,12 +263,13 @@ def render(plan, ev, gd, drive_master, drive_unsynced, eversolo_base, tag_text="
 
     w("\n## Decision summary\n\n"
       "| # | Bucket | Albums | Action |\n|--:|---|---:|---|\n"
-      f"| 1 | ✅ Same album on both (in sync) | {len(both)} | **none** |\n"
+      f"| 1 | ✅ Same album on both (in sync) | {len(both) - len(format_replace)} | **none** |\n"
       f"| 2 | 🔁 Same content, different folder name on each side | {len(ev_already_drive) + len(drive_already_ev)} | optional refactor (skip for first sync) |\n"
       f"| 3 | ⬇️ **PULL** — Drive `Music/` only | {len(pull)} | **`rclone copy` Drive → Eversolo** |\n"
       f"| 4 | ⬆️ **UPLOAD-TO-UNSYNCED** — Eversolo only or Eversolo-wins | **{len(upload_paths)}** | **`rclone copy` Eversolo → Drive `Music-unsynced/`** |\n"
-      f"| 5 | 🧹 Drive duplicate-album folders | {len(dup_drive)} | dedupe master (informational) |\n"
-      f"| 6 | 🧹 Eversolo duplicate-album folders | {len(dup_ev)} | dedupe mirror (informational) |\n"
+      f"| 5 | 🎚️ **FORMAT-REPLACE** — same album, format differs | {len(format_replace)} | opt-in via `eversolo-sync --force` (destructive: `rclone sync`) |\n"
+      f"| 6 | 🧹 Drive duplicate-album folders | {len(dup_drive)} | dedupe master (informational) |\n"
+      f"| 7 | 🧹 Eversolo duplicate-album folders | {len(dup_ev)} | dedupe mirror (informational) |\n"
       "\n---\n")
 
     w(f"\n## ⬇️ PULL — {len(pull)} albums to copy from Drive `Music/` to Eversolo\n")
@@ -285,14 +316,40 @@ def render(plan, ev, gd, drive_master, drive_unsynced, eversolo_base, tag_text="
                 w(f"    - `{p}`")
         w("")
 
-    w(f"\n## ✅ MATCH — {len(both)} albums in sync\n")
+    w(f"\n## 🎚️ FORMAT-REPLACE — {len(format_replace)} albums with format mismatch\n")
+    w("Same album content on both sides, but the file formats differ in the "
+      "canonical folders. Opt in via `eversolo-sync --apply --force` to replace "
+      "the Eversolo copy with Drive's version. **Destructive at the album-folder "
+      "level**: `rclone sync` deletes files on the Eversolo that aren't on Drive "
+      "(i.e. the old-format files), then copies in Drive's files.\n")
+    w("| Drive (source) | EV formats | DR formats |\n|---|---|---|")
+    def canonical_folder_exts_counter(d):
+        canonical_path = sorted(d["paths"])[0]
+        files = d["files"][canonical_path]
+        c = collections.Counter()
+        for f in files:
+            if "." in f:
+                c[f.rsplit(".", 1)[-1].lower()] += 1
+        return c
+    for k in format_replace:
+        gd_p = sorted(gd[k]["paths"])[0]
+        ec = canonical_folder_exts_counter(ev[k])
+        gc = canonical_folder_exts_counter(gd[k])
+        ef = "+".join(f"{n}× {e}" for e, n in ec.most_common())
+        gf = "+".join(f"{n}× {e}" for e, n in gc.most_common())
+        w(f"| `{gd_p}` | {ef} | {gf} |")
+    w("")
+
+    w(f"\n## ✅ MATCH — {len(both) - len(format_replace)} albums in sync\n")
     w("| Album | EV formats | DR formats |\n|---|---|---|")
+    fr_set = set(format_replace)
     for k in sorted(both):
+        if k in fr_set:
+            continue
         ev_p = sorted(ev[k]["paths"])[0]
         ef = "+".join(f"{n}×{e}" for e, n in ev[k]["exts"].most_common())
         gf = "+".join(f"{n}×{e}" for e, n in gd[k]["exts"].most_common())
-        marker = " ⚠ format diff" if ef != gf else ""
-        w(f"| `{ev_p}` | {ef} | {gf}{marker} |")
+        w(f"| `{ev_p}` | {ef} | {gf} |")
     w("\n---\n")
 
     # Machine-readable: only ONE PULL line per album (canonical Drive path)
@@ -307,6 +364,15 @@ def render(plan, ev, gd, drive_master, drive_unsynced, eversolo_base, tag_text="
     for (k, et, gt) in more_complete:
         for p in sorted(ev[k]["paths"]):
             w(f"UPLOAD-UNSYNCED\teversolo\t{p}\treason:more-complete-{et}vs{gt}")
+    for k in format_replace:
+        ev_p = sorted(ev[k]["paths"])[0]
+        gd_p = sorted(gd[k]["paths"])[0]
+        ec = canonical_folder_exts_counter(ev[k])
+        gc = canonical_folder_exts_counter(gd[k])
+        ef = "+".join(f"{n}{e}" for e, n in ec.most_common())
+        gf = "+".join(f"{n}{e}" for e, n in gc.most_common())
+        # ACTION  side=drive (source)  path=drive  notes
+        w(f"FORMAT-REPLACE\tdrive\t{gd_p}\teversolo:{ev_p}\tev-fmts:{ef}\tdr-fmts:{gf}")
     for (k, matches) in ev_already_drive:
         for p in sorted(ev[k]["paths"]):
             for (_, gd_info) in matches:
@@ -318,7 +384,10 @@ def render(plan, ev, gd, drive_master, drive_unsynced, eversolo_base, tag_text="
     for k in sorted(dup_ev):
         for p in sorted(dup_ev[k]["paths"]):
             w(f"DUP-EVERSOLO\teversolo\t{p}")
+    fr_set = set(format_replace)
     for k in sorted(both):
+        if k in fr_set:
+            continue
         for p in sorted(ev[k]["paths"]):
             w(f"SKIP\teversolo\t{p}")
     w("```")
@@ -440,11 +509,12 @@ def main():
     print(f"  UPLOAD-UNSYNCED paths: "
           f"{sum(1 for k in plan['anomaly'] for _ in ev[k]['paths']) + sum(1 for k,_,_ in plan['more_complete'] for _ in ev[k]['paths'])}",
           file=sys.stderr)
+    print(f"  FORMAT-REPLACE:        {len(plan['format_replace'])}  (opt-in via eversolo-sync --force)", file=sys.stderr)
     print(f"  REFACTOR pairs:        {len(plan['ev_already_drive']) + len(plan['drive_already_ev'])}",
           file=sys.stderr)
     print(f"  DUP-DRIVE:             {len(plan['dup_drive'])}", file=sys.stderr)
     print(f"  DUP-EVERSOLO:          {len(plan['dup_ev'])}", file=sys.stderr)
-    print(f"  SKIP (in sync):        {len(plan['both'])}", file=sys.stderr)
+    print(f"  SKIP (in sync):        {len(plan['both']) - len(plan['format_replace'])}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
